@@ -1,1 +1,1 @@
-web: node src/index.js
+web: bun src/index.js

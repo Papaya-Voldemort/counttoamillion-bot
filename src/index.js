@@ -20,10 +20,16 @@ const {
 // App initialisation
 // ---------------------------------------------------------------------------
 
+const { HTTPReceiver } = require('@slack/bolt');
+
+const receiver = new HTTPReceiver({
+  signingSecret: process.env.SLACK_SIGNING_SECRET,
+  endpoints: '/slack/events',
+});
+
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
-  signingSecret: process.env.SLACK_SIGNING_SECRET,
-  port: parseInt(process.env.PORT || '3000', 10),
+  receiver,
 });
 
 // CHANNEL_ID and the database are resolved after the HTTP server starts so
@@ -503,11 +509,88 @@ app.event('app_mention', async ({ event, client }) => {
 // Start
 // ---------------------------------------------------------------------------
 
+const PORT = parseInt(process.env.PORT || '3000', 10);
+
+// Start the bolt receiver so it registers its internal middleware, then spin
+// up Bun.serve() to explicitly own the HTTP layer.  This ensures POST requests
+// to /slack/events are always routed to the bolt handler — app.start() alone
+// was not reliably binding the server in the Railway environment.
 (async () => {
-  // Start the HTTP server first so Slack's URL-verification challenge is
-  // answered immediately, even before env vars are fully configured.
-  await app.start();
-  console.log(`⚡️ counttoamillion stats bot running on port ${process.env.PORT || 3000}`);
+  await app.init();
+
+  Bun.serve({
+    port: PORT,
+    async fetch(req) {
+      const url = new URL(req.url);
+
+      if (req.method === 'POST' && url.pathname === '/slack/events') {
+        const body = await req.text();
+
+        // Handle Slack's URL-verification challenge before signature checks
+        // so the endpoint can be registered even before signing secrets are set.
+        try {
+          const parsed = JSON.parse(body);
+          if (parsed.type === 'url_verification') {
+            return new Response(JSON.stringify({ challenge: parsed.challenge }), {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+        } catch (_) {
+          // Not JSON — fall through to the bolt handler
+        }
+
+        // Delegate all other Slack events to the bolt receiver's request handler.
+        // We reconstruct a Node-compatible IncomingMessage/ServerResponse pair
+        // via the receiver's built-in requestHandler.
+        return new Promise((resolve) => {
+          const headers = {};
+          req.headers.forEach((value, key) => { headers[key] = value; });
+
+          // Build a minimal Node-style IncomingMessage
+          const nodeReq = Object.assign(Object.create(require('stream').Readable.prototype), {
+            method: req.method,
+            url: url.pathname + (url.search || ''),
+            headers,
+            body,
+            // Provide a readable stream interface bolt expects
+            _body: body,
+          });
+          nodeReq.push(body);
+          nodeReq.push(null);
+
+          // Build a minimal Node-style ServerResponse
+          let statusCode = 200;
+          const resHeaders = {};
+          let responseBody = '';
+          const nodeRes = {
+            statusCode,
+            setHeader(name, value) { resHeaders[name] = value; },
+            getHeader(name) { return resHeaders[name]; },
+            writeHead(code, hdrs) {
+              statusCode = code;
+              if (hdrs) Object.assign(resHeaders, hdrs);
+            },
+            end(data) {
+              responseBody = data || '';
+              resolve(new Response(responseBody, {
+                status: statusCode,
+                headers: resHeaders,
+              }));
+            },
+            write(data) { responseBody += data; },
+          };
+
+          receiver.requestHandler(nodeReq, nodeRes);
+        });
+      }
+
+      // Health-check / catch-all
+      return new Response('Not found', { status: 404 });
+    },
+  });
+
+  console.log(`⚡️ counttoamillion stats bot running on port ${PORT}`);
 
   // Validate required env vars after the server is up.
   CHANNEL_ID = process.env.CHANNEL_ID;
