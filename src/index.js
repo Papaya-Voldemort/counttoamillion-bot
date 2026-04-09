@@ -28,17 +28,11 @@ const app = new App({
   port: parseInt(process.env.PORT || '3000', 10),
 });
 
-const CHANNEL_ID = process.env.CHANNEL_ID;
-if (!CHANNEL_ID) {
-  console.error('CHANNEL_ID environment variable is required.');
-  process.exit(1);
-}
-
-// ---------------------------------------------------------------------------
-// Database
-// ---------------------------------------------------------------------------
-
-const db = openDb();
+// CHANNEL_ID and the database are resolved after the HTTP server starts so
+// that Slack's URL-verification challenge can succeed even when env vars are
+// still being configured on the first deploy.
+let CHANNEL_ID;
+let db;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -340,6 +334,7 @@ async function runSync(client, { mode = 'incremental', statusChannel = null, pag
  * @returns {Promise<{ synced: boolean, capped: boolean }>}
  */
 async function ensureFresh(client) {
+  if (!CHANNEL_ID || !db) return { synced: false, capped: false };
   if (syncInProgress) return { synced: false, capped: false };
 
   // Fast check: fetch the single latest message in the channel
@@ -389,6 +384,7 @@ async function ensureFresh(client) {
 // ---------------------------------------------------------------------------
 
 app.message(async ({ message }) => {
+  if (!CHANNEL_ID || !db) return;
   if (message.channel !== CHANNEL_ID) return;
   if (message.subtype) return;
   if (message.bot_id) return;
@@ -412,6 +408,11 @@ app.message(async ({ message }) => {
 
 app.command('/ctm', async ({ command, ack, respond, client }) => {
   await ack();
+
+  if (!db) {
+    await respond({ response_type: 'ephemeral', text: ':x: Bot is still initializing. Please try again in a moment.' });
+    return;
+  }
 
   const parts = (command.text || '').trim().split(/\s+/);
   const sub = (parts[0] || '').toLowerCase();
@@ -476,6 +477,7 @@ app.command('/ctm', async ({ command, ack, respond, client }) => {
 // ---------------------------------------------------------------------------
 
 app.event('app_mention', async ({ event, client }) => {
+  if (!db) return;
   const text = (event.text || '').toLowerCase();
 
   let reply;
@@ -504,9 +506,21 @@ app.event('app_mention', async ({ event, client }) => {
 // ---------------------------------------------------------------------------
 
 (async () => {
+  // Start the HTTP server first so Slack's URL-verification challenge is
+  // answered immediately, even before env vars are fully configured.
   await app.start();
+  console.log(`⚡️ counttoamillion stats bot running on port ${process.env.PORT || 3000}`);
+
+  // Validate required env vars after the server is up.
+  CHANNEL_ID = process.env.CHANNEL_ID;
+  if (!CHANNEL_ID) {
+    console.error('⚠️  CHANNEL_ID environment variable is required. The bot is running but will not process any events until CHANNEL_ID is set and the app is restarted.');
+    return;
+  }
+
+  db = openDb();
+
   const { totalCounts, totalContributors, highestCount } = getProgress(db);
-  console.log(`⚡️ counttoamillion stats bot running (port ${process.env.PORT || 3000})`);
   console.log(`   Channel:      ${CHANNEL_ID}`);
   console.log(`   DB:           ${process.env.DB_FILE || 'data/ctm.db'}`);
   console.log(`   Contributors: ${totalContributors}`);
