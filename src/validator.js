@@ -4,7 +4,7 @@
  * Valid formats per channel rules:
  *   "123"           - bare number
  *   "123 some text" - number followed by space + chat
- *   "123 - comment" - number followed by space-dash-space + chat
+ *   "123 - comment" - number followed by dash + chat
  *   "123\ncomment"  - number followed by newline + chat
  *
  * @param {string} text - The raw message text
@@ -21,23 +21,4 @@ function parseCount(text) {
   return null;
 }
 
-/**
- * Validates a submitted count against the current channel state.
- *
- * @param {number} number           - The number the user submitted
- * @param {number} expectedCount    - The next expected count (currentCount + 1)
- * @param {string} userId           - Slack user ID of the submitter
- * @param {string|null} lastCounterUserId - Slack user ID of the previous valid counter
- * @returns {{ valid: boolean, error: string|null, expected?: number }}
- */
-function validateCount(number, expectedCount, userId, lastCounterUserId) {
-  if (userId === lastCounterUserId) {
-    return { valid: false, error: 'consecutive' };
-  }
-  if (number !== expectedCount) {
-    return { valid: false, error: 'wrong_number', expected: expectedCount };
-  }
-  return { valid: true, error: null };
-}
-
-module.exports = { parseCount, validateCount };
+module.exports = { parseCount };

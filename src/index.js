@@ -1,6 +1,6 @@
 require('dotenv').config();
 const { App } = require('@slack/bolt');
-const { parseCount, validateCount } = require('./validator');
+const { parseCount } = require('./validator');
 const { loadState, saveState } = require('./state');
 
 // ---------------------------------------------------------------------------
@@ -15,7 +15,7 @@ const app = new App({
   port: parseInt(process.env.PORT || '3000', 10),
 });
 
-/** The Slack channel ID the bot moderates (required). */
+/** Slack channel ID for #counttoamillion (used when fetching history). */
 const CHANNEL_ID = process.env.CHANNEL_ID;
 
 if (!CHANNEL_ID) {
@@ -24,141 +24,280 @@ if (!CHANNEL_ID) {
 }
 
 // ---------------------------------------------------------------------------
-// In-memory state (persisted to disk after each change)
+// State
 // ---------------------------------------------------------------------------
 
 let state = loadState();
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Formatting helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Returns a sorted leaderboard array from userCounts.
- * @returns {{ userId: string, count: number }[]}
- */
-function getLeaderboard() {
+const GOAL = 1_000_000;
+const MEDALS = [':first_place_medal:', ':second_place_medal:', ':third_place_medal:'];
+
+/** Returns userCounts sorted descending by count. */
+function getSortedLeaderboard() {
   return Object.entries(state.userCounts)
     .map(([userId, count]) => ({ userId, count }))
     .sort((a, b) => b.count - a.count);
 }
 
 /**
- * Builds a leaderboard message string (Slack mrkdwn).
+ * Formats the top-N leaderboard as Slack mrkdwn.
  * @param {number} [limit=10]
- * @returns {string}
  */
 function formatLeaderboard(limit = 10) {
-  const board = getLeaderboard().slice(0, limit);
+  const board = getSortedLeaderboard().slice(0, limit);
   if (board.length === 0) {
-    return 'No counts recorded yet!';
+    return ':warning: No stats recorded yet. Run `/ctm sync` to build stats from channel history.';
   }
-  const medals = [':first_place_medal:', ':second_place_medal:', ':third_place_medal:'];
   const lines = board.map(({ userId, count }, i) => {
-    const prefix = medals[i] || `${i + 1}.`;
-    return `${prefix} <@${userId}> — ${count.toLocaleString()} count${count === 1 ? '' : 's'}`;
+    const prefix = MEDALS[i] || `${i + 1}.`;
+    return `${prefix} <@${userId}> — *${count.toLocaleString()}* count${count === 1 ? '' : 's'}`;
   });
   return (
     `*:1234: #counttoamillion Leaderboard* (top ${board.length})\n` +
-    `Current count: *${state.currentCount.toLocaleString()}* / 1,000,000\n\n` +
+    `Current count: *${state.currentCount.toLocaleString()}* / ${GOAL.toLocaleString()}\n\n` +
     lines.join('\n')
   );
 }
 
+/**
+ * Formats stats for a single user as Slack mrkdwn.
+ * @param {string} userId  Slack user ID
+ */
+function formatUserStats(userId) {
+  const userCount = state.userCounts[userId] || 0;
+  if (userCount === 0) {
+    return `<@${userId}> hasn't contributed any counts yet.`;
+  }
+  const board = getSortedLeaderboard();
+  const rank = board.findIndex((e) => e.userId === userId) + 1;
+  const total = board.reduce((s, e) => s + e.count, 0);
+  const pct = total > 0 ? ((userCount / total) * 100).toFixed(1) : '0.0';
+  return (
+    `*:bar_chart: Stats for <@${userId}>*\n` +
+    `:1234: Counts posted: *${userCount.toLocaleString()}*\n` +
+    `:trophy: Rank: *#${rank}* of ${board.length}\n` +
+    `:chart_with_upwards_trend: Share of all counts: *${pct}%*`
+  );
+}
+
+/** Formats overall channel progress as Slack mrkdwn. */
+function formatProgress() {
+  const current = state.currentCount;
+  const remaining = GOAL - current;
+  const pct = ((current / GOAL) * 100).toFixed(2);
+  const totalContributors = Object.keys(state.userCounts).length;
+  const filledBars = Math.round((current / GOAL) * 20);
+  const progressBar = '\u2588'.repeat(filledBars) + '\u2591'.repeat(20 - filledBars);
+
+  return (
+    `*:rocket: #counttoamillion Progress*\n\n` +
+    `\`${progressBar}\` ${pct}%\n\n` +
+    `:round_pushpin: Current count: *${current.toLocaleString()}* / ${GOAL.toLocaleString()}\n` +
+    `:checkered_flag: Remaining: *${remaining.toLocaleString()}*\n` +
+    `:busts_in_silhouette: Contributors: *${totalContributors}*`
+  );
+}
+
+/** Formats a help message listing available commands. */
+function formatHelp() {
+  return (
+    `*:wave: counttoamillion Stats Bot — Commands*\n\n` +
+    `*/ctm leaderboard* — Top 10 counters\n` +
+    `*/ctm leaderboard [N]* — Top N counters (e.g. \`/ctm leaderboard 25\`)\n` +
+    `*/ctm stats* — Your personal counting stats\n` +
+    `*/ctm stats @user* — Stats for another user\n` +
+    `*/ctm progress* — Overall channel progress toward 1,000,000\n` +
+    `*/ctm sync* — Resync stats from channel history _(admin, runs in background)_\n\n` +
+    `You can also mention me: \`@CountBot leaderboard\`, \`@CountBot stats\`, \`@CountBot progress\``
+  );
+}
+
 // ---------------------------------------------------------------------------
-// Message event: validate counts
+// Channel history sync
 // ---------------------------------------------------------------------------
 
-app.message(async ({ message, client }) => {
-  // Only process messages from the configured counting channel
-  if (message.channel !== CHANNEL_ID) return;
+let syncInProgress = false;
 
-  // Ignore edits, deletions, bot messages, and thread replies
-  if (message.subtype) return;
-  if (message.thread_ts && message.thread_ts !== message.ts) return;
-  if (!message.text) return;
+/**
+ * Fetches all messages from the counting channel and rebuilds userCounts from scratch.
+ * Runs in the background — posts a status message when done.
+ *
+ * @param {object} client           Slack Web API client
+ * @param {string} responseChannel  Where to post the completion notice
+ */
+async function syncHistory(client, responseChannel) {
+  if (syncInProgress) {
+    await client.chat.postMessage({
+      channel: responseChannel,
+      text: ':hourglass: A sync is already in progress. Please wait for it to finish.',
+    });
+    return;
+  }
 
-  const number = parseCount(message.text);
-  if (number === null) return; // Not a count message, ignore
+  syncInProgress = true;
+  console.log('Starting channel history sync...');
 
-  const expectedCount = state.currentCount + 1;
-  const validation = validateCount(number, expectedCount, message.user, state.lastCounterUserId);
+  const freshCounts = {};
+  let highestCount = 0;
+  let cursor;
+  let pagesFetched = 0;
+  let messagesParsed = 0;
 
-  if (validation.valid) {
-    // --- Valid count ---
-    state.currentCount = number;
-    state.lastCounterUserId = message.user;
-    state.userCounts[message.user] = (state.userCounts[message.user] || 0) + 1;
+  try {
+    do {
+      const result = await client.conversations.history({
+        channel: CHANNEL_ID,
+        limit: 200,
+        cursor,
+      });
+
+      for (const msg of result.messages || []) {
+        // Skip subtypes (edits, joins), bots, and thread replies
+        if (msg.subtype) continue;
+        if (msg.bot_id) continue;
+        if (msg.thread_ts && msg.thread_ts !== msg.ts) continue;
+
+        const number = parseCount(msg.text);
+        if (number !== null && msg.user) {
+          freshCounts[msg.user] = (freshCounts[msg.user] || 0) + 1;
+          if (number > highestCount) highestCount = number;
+          messagesParsed++;
+        }
+      }
+
+      cursor = result.response_metadata && result.response_metadata.next_cursor;
+      pagesFetched++;
+    } while (cursor);
+
+    state.userCounts = freshCounts;
+    state.currentCount = highestCount;
     saveState(state);
 
-    await client.reactions.add({
-      channel: message.channel,
-      timestamp: message.ts,
-      name: 'white_check_mark',
-    }).catch((err) => console.error('react error:', err.message));
+    const userCount = Object.keys(freshCounts).length;
+    console.log(`Sync complete: ${messagesParsed} counts across ${userCount} users.`);
 
-    // Celebrate milestones (every 1000)
-    if (number % 1000 === 0) {
-      await client.chat.postMessage({
-        channel: message.channel,
-        text: `:tada: Congratulations! We've reached *${number.toLocaleString()}*! :tada:\nOnly *${(1_000_000 - number).toLocaleString()}* to go!`,
-      }).catch((err) => console.error('milestone error:', err.message));
+    await client.chat.postMessage({
+      channel: responseChannel,
+      text:
+        `:white_check_mark: Sync complete! Processed *${messagesParsed.toLocaleString()}* count messages ` +
+        `from *${userCount}* contributors across *${pagesFetched}* pages of history.\n` +
+        `Highest count seen: *${highestCount.toLocaleString()}*.`,
+    });
+  } catch (err) {
+    console.error('Sync failed:', err.message);
+    await client.chat.postMessage({
+      channel: responseChannel,
+      text: `:x: Sync failed: ${err.message}`,
+    }).catch(() => {});
+  } finally {
+    syncInProgress = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Passive message listener — silently updates stats, no reactions or replies
+// ---------------------------------------------------------------------------
+
+app.message(async ({ message }) => {
+  // Only track messages from the configured counting channel
+  if (message.channel !== CHANNEL_ID) return;
+
+  // Skip subtypes (edits, joins), bots, and thread replies
+  if (message.subtype) return;
+  if (message.bot_id) return;
+  if (message.thread_ts && message.thread_ts !== message.ts) return;
+  if (!message.text || !message.user) return;
+
+  const number = parseCount(message.text);
+  if (number === null) return;
+
+  // Silently update stats — no reactions, no replies, completely invisible
+  state.userCounts[message.user] = (state.userCounts[message.user] || 0) + 1;
+  if (number > state.currentCount) state.currentCount = number;
+  saveState(state);
+});
+
+// ---------------------------------------------------------------------------
+// Slash command: /ctm — dispatches sub-commands
+// ---------------------------------------------------------------------------
+
+app.command('/ctm', async ({ command, ack, respond, client }) => {
+  await ack();
+
+  const parts = (command.text || '').trim().split(/\s+/);
+  const sub = (parts[0] || '').toLowerCase();
+
+  switch (sub) {
+    case 'leaderboard': {
+      const limit = parseInt(parts[1], 10);
+      const safeLimit = Number.isNaN(limit) || limit < 1 ? 10 : Math.min(limit, 50);
+      await respond({ response_type: 'in_channel', text: formatLeaderboard(safeLimit) });
+      break;
     }
-  } else {
-    // --- Invalid count ---
-    await client.reactions.add({
-      channel: message.channel,
-      timestamp: message.ts,
-      name: 'bangbang',
-    }).catch((err) => console.error('react error:', err.message));
 
-    let errorText;
-    if (validation.error === 'consecutive') {
-      errorText = "You can't count twice in a row, minion.";
-    } else {
-      errorText = `That's the wrong number, minion, it should be ${validation.expected}.`;
+    case 'stats': {
+      // Resolve a user mention like <@U1234|name> → U1234, or fall back to caller
+      let targetUserId = command.user_id;
+      if (parts[1]) {
+        const mentionMatch = parts[1].match(/^<@([A-Z0-9]+)(?:\|[^>]+)?>$/i);
+        targetUserId = mentionMatch ? mentionMatch[1] : command.user_id;
+      }
+      await respond({ response_type: 'ephemeral', text: formatUserStats(targetUserId) });
+      break;
     }
 
-    await client.chat.postEphemeral({
-      channel: message.channel,
-      user: message.user,
-      text: errorText,
-    }).catch((err) => console.error('ephemeral error:', err.message));
+    case 'progress': {
+      await respond({ response_type: 'in_channel', text: formatProgress() });
+      break;
+    }
+
+    case 'sync': {
+      await respond({
+        response_type: 'ephemeral',
+        text: ":arrows_counterclockwise: Starting a full history sync in the background. This may take a while for large channels. I'll post a message here when it's done.",
+      });
+      // Fire-and-forget — runs in background
+      syncHistory(client, command.channel_id).catch((err) =>
+        console.error('Sync error:', err.message)
+      );
+      break;
+    }
+
+    case 'help':
+    default: {
+      await respond({ response_type: 'ephemeral', text: formatHelp() });
+      break;
+    }
   }
 });
 
 // ---------------------------------------------------------------------------
-// Slash command: /count — show current count and leaderboard
-// ---------------------------------------------------------------------------
-
-app.command('/count', async ({ command, ack, respond }) => {
-  await ack();
-  await respond({
-    response_type: 'in_channel',
-    text: formatLeaderboard(),
-  });
-});
-
-// ---------------------------------------------------------------------------
-// App mention: show current count
+// App mention handler
 // ---------------------------------------------------------------------------
 
 app.event('app_mention', async ({ event, client }) => {
-  const text = event.text || '';
+  const text = (event.text || '').toLowerCase();
 
-  if (text.toLowerCase().includes('leaderboard') || text.toLowerCase().includes('stats')) {
-    await client.chat.postMessage({
-      channel: event.channel,
-      thread_ts: event.ts,
-      text: formatLeaderboard(),
-    }).catch((err) => console.error('mention reply error:', err.message));
+  let reply;
+  if (text.includes('leaderboard')) {
+    reply = formatLeaderboard();
+  } else if (text.includes('progress')) {
+    reply = formatProgress();
+  } else if (text.includes('stats')) {
+    reply = formatUserStats(event.user);
   } else {
-    await client.chat.postMessage({
-      channel: event.channel,
-      thread_ts: event.ts,
-      text: `The current count is *${state.currentCount.toLocaleString()}*. Only *${(1_000_000 - state.currentCount).toLocaleString()}* left to reach 1,000,000! Mention me with "leaderboard" to see the top counters.`,
-    }).catch((err) => console.error('mention reply error:', err.message));
+    reply = formatHelp();
   }
+
+  await client.chat.postMessage({
+    channel: event.channel,
+    thread_ts: event.ts,
+    text: reply,
+  }).catch((err) => console.error('mention reply error:', err.message));
 });
 
 // ---------------------------------------------------------------------------
@@ -167,7 +306,8 @@ app.event('app_mention', async ({ event, client }) => {
 
 (async () => {
   await app.start();
-  console.log(`⚡️ counttoamillion bot is running (port ${process.env.PORT || 3000})`);
-  console.log(`   Monitoring channel: ${CHANNEL_ID}`);
+  console.log(`⚡️ counttoamillion stats bot is running (port ${process.env.PORT || 3000})`);
+  console.log(`   Channel: ${CHANNEL_ID}`);
+  console.log(`   Stored contributors: ${Object.keys(state.userCounts).length}`);
   console.log(`   Current count: ${state.currentCount}`);
 })();

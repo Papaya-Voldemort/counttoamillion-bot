@@ -1,7 +1,7 @@
 {
   "name": "counttoamillion-bot",
   "version": "1.0.0",
-  "description": "A Slack bot for the #counttoamillion channel that validates counts, tracks progress, and enforces counting rules.",
+  "description": "A stats-only Slack bot for the #counttoamillion channel that tracks counting statistics and displays leaderboards.",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",

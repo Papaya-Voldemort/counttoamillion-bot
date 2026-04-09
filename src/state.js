@@ -5,17 +5,19 @@ const STATE_FILE = process.env.STATE_FILE || path.join(__dirname, '../data/state
 
 /**
  * Default state shape.
- * @type {{ currentCount: number, lastCounterUserId: string|null, userCounts: Object.<string,number> }}
+ * currentCount: highest count number seen in the channel (used for progress display).
+ * userCounts:   map of Slack user ID → number of count messages they have posted.
+ *
+ * @type {{ currentCount: number, userCounts: Object.<string,number> }}
  */
 const DEFAULT_STATE = {
   currentCount: 0,
-  lastCounterUserId: null,
   userCounts: {},
 };
 
 /**
- * Loads the bot state from disk.  Returns defaults if the file doesn't exist or is corrupt.
- * @returns {{ currentCount: number, lastCounterUserId: string|null, userCounts: Object.<string,number> }}
+ * Loads the bot state from disk. Returns defaults if the file doesn't exist or is corrupt.
+ * @returns {{ currentCount: number, userCounts: Object.<string,number> }}
  */
 function loadState() {
   try {
@@ -30,14 +32,12 @@ function loadState() {
   } catch (err) {
     console.error('Error loading state, starting fresh:', err.message);
   }
-  // Allow the starting count to be seeded via environment variable
-  const seedCount = parseInt(process.env.INITIAL_COUNT || '0', 10);
-  return { ...DEFAULT_STATE, currentCount: Number.isNaN(seedCount) ? 0 : seedCount };
+  return { ...DEFAULT_STATE };
 }
 
 /**
  * Persists the bot state to disk.
- * @param {{ currentCount: number, lastCounterUserId: string|null, userCounts: Object.<string,number> }} state
+ * @param {{ currentCount: number, userCounts: Object.<string,number> }} state
  */
 function saveState(state) {
   try {

@@ -1,4 +1,4 @@
-const { parseCount, validateCount } = require('../src/validator');
+const { parseCount } = require('../src/validator');
 
 describe('parseCount', () => {
   test('parses a bare number', () => {
@@ -35,37 +35,5 @@ describe('parseCount', () => {
 
   test('trims leading whitespace before parsing', () => {
     expect(parseCount('  100 ')).toBe(100);
-  });
-});
-
-describe('validateCount', () => {
-  test('accepts a correct count from a different user', () => {
-    const result = validateCount(5, 5, 'USER_A', 'USER_B');
-    expect(result).toEqual({ valid: true, error: null });
-  });
-
-  test('rejects a correct number from the same user (consecutive)', () => {
-    const result = validateCount(5, 5, 'USER_A', 'USER_A');
-    expect(result.valid).toBe(false);
-    expect(result.error).toBe('consecutive');
-  });
-
-  test('rejects a wrong number from a different user', () => {
-    const result = validateCount(7, 5, 'USER_A', 'USER_B');
-    expect(result.valid).toBe(false);
-    expect(result.error).toBe('wrong_number');
-    expect(result.expected).toBe(5);
-  });
-
-  test('rejects a wrong number that is also consecutive', () => {
-    // Consecutive check takes priority
-    const result = validateCount(99, 5, 'USER_A', 'USER_A');
-    expect(result.valid).toBe(false);
-    expect(result.error).toBe('consecutive');
-  });
-
-  test('accepts first count (no previous counter)', () => {
-    const result = validateCount(1, 1, 'USER_A', null);
-    expect(result).toEqual({ valid: true, error: null });
   });
 });
