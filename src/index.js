@@ -1,7 +1,18 @@
 require('dotenv').config();
 const { App } = require('@slack/bolt');
 const { parseCount } = require('./validator');
-const { loadState, saveState } = require('./state');
+const {
+  openDb,
+  upsertCount,
+  bulkUpsertCounts,
+  clearAll,
+  getLeaderboard,
+  getUserStats,
+  getProgress,
+  getLatestTs,
+  getMeta,
+  setMeta,
+} = require('./db');
 
 // ---------------------------------------------------------------------------
 // App initialisation
@@ -15,19 +26,17 @@ const app = new App({
   port: parseInt(process.env.PORT || '3000', 10),
 });
 
-/** Slack channel ID for #counttoamillion (used when fetching history). */
 const CHANNEL_ID = process.env.CHANNEL_ID;
-
 if (!CHANNEL_ID) {
   console.error('CHANNEL_ID environment variable is required.');
   process.exit(1);
 }
 
 // ---------------------------------------------------------------------------
-// State
+// Database
 // ---------------------------------------------------------------------------
 
-let state = loadState();
+const db = openDb();
 
 // ---------------------------------------------------------------------------
 // Formatting helpers
@@ -36,177 +45,240 @@ let state = loadState();
 const GOAL = 1_000_000;
 const MEDALS = [':first_place_medal:', ':second_place_medal:', ':third_place_medal:'];
 
-/** Returns userCounts sorted descending by count. */
-function getSortedLeaderboard() {
-  return Object.entries(state.userCounts)
-    .map(([userId, count]) => ({ userId, count }))
-    .sort((a, b) => b.count - a.count);
+/** Returns the current time as Unix seconds. */
+function nowUnix() {
+  return Math.floor(Date.now() / 1000);
+}
+
+/** Formats a Unix timestamp as a short date string. */
+function fmtDate(unixSec) {
+  return new Date(unixSec * 1000).toLocaleDateString('en-US', {
+    year: 'numeric', month: 'short', day: 'numeric',
+  });
 }
 
 /**
- * Formats the top-N leaderboard as Slack mrkdwn.
+ * Builds a mrkdwn leaderboard string.
  * @param {number} [limit=10]
  */
 function formatLeaderboard(limit = 10) {
-  const board = getSortedLeaderboard().slice(0, limit);
+  const board = getLeaderboard(db, limit);
   if (board.length === 0) {
     return ':warning: No stats recorded yet. Run `/ctm sync` to build stats from channel history.';
   }
+
+  const { highestCount, totalCounts } = getProgress(db);
+  const lastSync = getMeta(db, 'last_sync_at');
+  const syncNote = lastSync ? `_Last synced: ${lastSync}_` : '_Run `/ctm sync` to backfill history_';
+
   const lines = board.map(({ userId, count }, i) => {
     const prefix = MEDALS[i] || `${i + 1}.`;
-    return `${prefix} <@${userId}> — *${count.toLocaleString()}* count${count === 1 ? '' : 's'}`;
+    const pct = totalCounts > 0 ? ((count / totalCounts) * 100).toFixed(1) : '0.0';
+    return `${prefix} <@${userId}> — *${count.toLocaleString()}* counts (${pct}%)`;
   });
-  return (
-    `*:1234: #counttoamillion Leaderboard* (top ${board.length})\n` +
-    `Current count: *${state.currentCount.toLocaleString()}* / ${GOAL.toLocaleString()}\n\n` +
-    lines.join('\n')
-  );
+
+  return [
+    `*:1234: #counttoamillion Leaderboard* (top ${board.length})`,
+    `Progress: *${highestCount.toLocaleString()}* / ${GOAL.toLocaleString()} — ${totalCounts.toLocaleString()} total counts recorded`,
+    '',
+    lines.join('\n'),
+    '',
+    syncNote,
+  ].join('\n');
 }
 
 /**
- * Formats stats for a single user as Slack mrkdwn.
- * @param {string} userId  Slack user ID
+ * Builds a mrkdwn stats string for one user.
+ * @param {string} userId
  */
 function formatUserStats(userId) {
-  const userCount = state.userCounts[userId] || 0;
-  if (userCount === 0) {
+  const stats = getUserStats(db, userId);
+  if (!stats) {
     return `<@${userId}> hasn't contributed any counts yet.`;
   }
-  const board = getSortedLeaderboard();
-  const rank = board.findIndex((e) => e.userId === userId) + 1;
-  const total = board.reduce((s, e) => s + e.count, 0);
-  const pct = total > 0 ? ((userCount / total) * 100).toFixed(1) : '0.0';
-  return (
-    `*:bar_chart: Stats for <@${userId}>*\n` +
-    `:1234: Counts posted: *${userCount.toLocaleString()}*\n` +
-    `:trophy: Rank: *#${rank}* of ${board.length}\n` +
-    `:chart_with_upwards_trend: Share of all counts: *${pct}%*`
-  );
+
+  const { userCount, rank, totalCount, totalContributors } = stats;
+  const pct = totalCount > 0 ? ((userCount / totalCount) * 100).toFixed(1) : '0.0';
+
+  return [
+    `*:bar_chart: Stats for <@${userId}>*`,
+    `:1234: Counts posted: *${userCount.toLocaleString()}*`,
+    `:trophy: Rank: *#${rank}* of ${totalContributors.toLocaleString()} contributors`,
+    `:chart_with_upwards_trend: Share of all counts: *${pct}%*`,
+  ].join('\n');
 }
 
-/** Formats overall channel progress as Slack mrkdwn. */
+/** Builds a mrkdwn progress string. */
 function formatProgress() {
-  const current = state.currentCount;
-  const remaining = GOAL - current;
-  const pct = ((current / GOAL) * 100).toFixed(2);
-  const totalContributors = Object.keys(state.userCounts).length;
-  const filledBars = Math.round((current / GOAL) * 20);
-  const progressBar = '\u2588'.repeat(filledBars) + '\u2591'.repeat(20 - filledBars);
+  const { highestCount, totalCounts, totalContributors } = getProgress(db);
+  const remaining = GOAL - highestCount;
+  const pct = ((highestCount / GOAL) * 100).toFixed(2);
+  const filledBars = Math.min(20, Math.round((highestCount / GOAL) * 20));
+  const bar = '\u2588'.repeat(filledBars) + '\u2591'.repeat(20 - filledBars);
 
-  return (
-    `*:rocket: #counttoamillion Progress*\n\n` +
-    `\`${progressBar}\` ${pct}%\n\n` +
-    `:round_pushpin: Current count: *${current.toLocaleString()}* / ${GOAL.toLocaleString()}\n` +
-    `:checkered_flag: Remaining: *${remaining.toLocaleString()}*\n` +
-    `:busts_in_silhouette: Contributors: *${totalContributors}*`
-  );
+  return [
+    '*:rocket: #counttoamillion Progress*',
+    '',
+    `\`${bar}\` ${pct}%`,
+    '',
+    `:round_pushpin: Current count: *${highestCount.toLocaleString()}* / ${GOAL.toLocaleString()}`,
+    `:checkered_flag: Remaining: *${remaining.toLocaleString()}*`,
+    `:memo: Total count messages: *${totalCounts.toLocaleString()}*`,
+    `:busts_in_silhouette: Contributors: *${totalContributors.toLocaleString()}*`,
+  ].join('\n');
 }
 
-/** Formats a help message listing available commands. */
+/** Builds a mrkdwn help string. */
 function formatHelp() {
-  return (
-    `*:wave: counttoamillion Stats Bot — Commands*\n\n` +
-    `*/ctm leaderboard* — Top 10 counters\n` +
-    `*/ctm leaderboard [N]* — Top N counters (e.g. \`/ctm leaderboard 25\`)\n` +
-    `*/ctm stats* — Your personal counting stats\n` +
-    `*/ctm stats @user* — Stats for another user\n` +
-    `*/ctm progress* — Overall channel progress toward 1,000,000\n` +
-    `*/ctm sync* — Resync stats from channel history _(admin, runs in background)_\n\n` +
-    `You can also mention me: \`@CountBot leaderboard\`, \`@CountBot stats\`, \`@CountBot progress\``
-  );
+  return [
+    '*:wave: counttoamillion Stats Bot — Commands*',
+    '',
+    '*/ctm leaderboard* — Top 10 counters (public)',
+    '*/ctm leaderboard [N]* — Top N counters, e.g. `/ctm leaderboard 25` (max 50)',
+    '*/ctm stats* — Your personal counting stats (private)',
+    '*/ctm stats @user* — Stats for another user (private)',
+    '*/ctm progress* — Visual progress bar toward 1,000,000 (public)',
+    '*/ctm sync* — Full history sync from Slack _(runs in background)_',
+    '*/ctm sync incremental* — Sync only new messages since last sync',
+    '*/ctm help* — This message',
+    '',
+    'You can also `@mention` me: `leaderboard`, `stats`, or `progress`',
+  ].join('\n');
 }
 
 // ---------------------------------------------------------------------------
-// Channel history sync
+// History sync
 // ---------------------------------------------------------------------------
 
 let syncInProgress = false;
 
 /**
- * Fetches all messages from the counting channel and rebuilds userCounts from scratch.
- * Runs in the background — posts a status message when done.
+ * Fetches messages from the counting channel and inserts them into SQLite.
  *
- * @param {object} client           Slack Web API client
- * @param {string} responseChannel  Where to post the completion notice
+ * When `incremental` is true, only messages newer than the latest DB entry
+ * are fetched — much faster for routine catch-ups.
+ *
+ * @param {object}  client
+ * @param {string}  responseChannel
+ * @param {boolean} [incremental=false]
  */
-async function syncHistory(client, responseChannel) {
+async function syncHistory(client, responseChannel, incremental = false) {
   if (syncInProgress) {
     await client.chat.postMessage({
       channel: responseChannel,
-      text: ':hourglass: A sync is already in progress. Please wait for it to finish.',
+      text: ':hourglass: A sync is already running. Please wait.',
     });
     return;
   }
 
   syncInProgress = true;
-  console.log('Starting channel history sync...');
 
-  const freshCounts = {};
-  let highestCount = 0;
+  const mode = incremental ? 'incremental' : 'full';
+  const latestTs = incremental ? getLatestTs(db) : null;
+  console.log(`Starting ${mode} history sync (since ts: ${latestTs || 'beginning'})…`);
+
+  const batch = [];
   let cursor;
   let pagesFetched = 0;
   let messagesParsed = 0;
+  let highestNewCount = 0;
 
   try {
+    if (!incremental) {
+      clearAll(db);
+    }
+
+    // Status message — update in place
+    const statusMsg = await client.chat.postMessage({
+      channel: responseChannel,
+      text: `:arrows_counterclockwise: ${incremental ? 'Incremental' : 'Full'} sync started…`,
+    });
+
+    const FLUSH_BATCH = 1000; // insert every N messages
+    const editStatus = async (text) => {
+      await client.chat.update({
+        channel: responseChannel,
+        ts: statusMsg.ts,
+        text,
+      }).catch(() => {});
+    };
+
     do {
-      const result = await client.conversations.history({
-        channel: CHANNEL_ID,
-        limit: 200,
-        cursor,
-      });
+      const params = { channel: CHANNEL_ID, limit: 200, cursor };
+      if (latestTs) params.oldest = latestTs;
+
+      const result = await client.conversations.history(params);
 
       for (const msg of result.messages || []) {
-        // Skip subtypes (edits, joins), bots, and thread replies
         if (msg.subtype) continue;
         if (msg.bot_id) continue;
         if (msg.thread_ts && msg.thread_ts !== msg.ts) continue;
 
         const number = parseCount(msg.text);
         if (number !== null && msg.user) {
-          freshCounts[msg.user] = (freshCounts[msg.user] || 0) + 1;
-          if (number > highestCount) highestCount = number;
+          batch.push({ slackTs: msg.ts, userId: msg.user, number });
+          if (number > highestNewCount) highestNewCount = number;
           messagesParsed++;
         }
       }
 
+      // Flush to DB in batches to keep memory low
+      if (batch.length >= FLUSH_BATCH) {
+        bulkUpsertCounts(db, batch);
+        batch.length = 0;
+      }
+
       cursor = result.response_metadata && result.response_metadata.next_cursor;
       pagesFetched++;
+
+      // Update status every 10 pages (~2000 messages)
+      if (pagesFetched % 10 === 0) {
+        await editStatus(
+          `:arrows_counterclockwise: Sync in progress… ${messagesParsed.toLocaleString()} count messages processed (${pagesFetched} pages fetched)`
+        );
+      }
     } while (cursor);
 
-    state.userCounts = freshCounts;
-    state.currentCount = highestCount;
-    saveState(state);
+    // Flush remaining rows
+    if (batch.length > 0) {
+      bulkUpsertCounts(db, batch);
+    }
 
-    const userCount = Object.keys(freshCounts).length;
-    console.log(`Sync complete: ${messagesParsed} counts across ${userCount} users.`);
+    const syncAt = fmtDate(nowUnix());
+    setMeta(db, 'last_sync_at', syncAt);
+    setMeta(db, 'last_sync_mode', mode);
 
-    await client.chat.postMessage({
-      channel: responseChannel,
-      text:
-        `:white_check_mark: Sync complete! Processed *${messagesParsed.toLocaleString()}* count messages ` +
-        `from *${userCount}* contributors across *${pagesFetched}* pages of history.\n` +
-        `Highest count seen: *${highestCount.toLocaleString()}*.`,
-    });
+    const { totalCounts, totalContributors, highestCount } = getProgress(db);
+    console.log(`Sync complete: ${messagesParsed} new count messages across ${pagesFetched} pages.`);
+
+    await editStatus(
+      [
+        `:white_check_mark: *${incremental ? 'Incremental' : 'Full'} sync complete!*`,
+        `:inbox_tray: New count messages processed: *${messagesParsed.toLocaleString()}*`,
+        `:1234: Total in DB: *${totalCounts.toLocaleString()}* from *${totalContributors.toLocaleString()}* contributors`,
+        `:round_pushpin: Highest count seen: *${highestCount.toLocaleString()}*`,
+        `:calendar: Synced at: ${syncAt}`,
+      ].join('\n')
+    );
   } catch (err) {
     console.error('Sync failed:', err.message);
-    await client.chat.postMessage({
-      channel: responseChannel,
-      text: `:x: Sync failed: ${err.message}`,
-    }).catch(() => {});
+    try {
+      await client.chat.postMessage({
+        channel: responseChannel,
+        text: `:x: Sync failed: ${err.message}`,
+      });
+    } catch (_) {}
   } finally {
     syncInProgress = false;
   }
 }
 
 // ---------------------------------------------------------------------------
-// Passive message listener — silently updates stats, no reactions or replies
+// Passive message listener — completely silent, just writes to DB
 // ---------------------------------------------------------------------------
 
 app.message(async ({ message }) => {
-  // Only track messages from the configured counting channel
   if (message.channel !== CHANNEL_ID) return;
-
-  // Skip subtypes (edits, joins), bots, and thread replies
   if (message.subtype) return;
   if (message.bot_id) return;
   if (message.thread_ts && message.thread_ts !== message.ts) return;
@@ -215,14 +287,11 @@ app.message(async ({ message }) => {
   const number = parseCount(message.text);
   if (number === null) return;
 
-  // Silently update stats — no reactions, no replies, completely invisible
-  state.userCounts[message.user] = (state.userCounts[message.user] || 0) + 1;
-  if (number > state.currentCount) state.currentCount = number;
-  saveState(state);
+  upsertCount(db, message.ts, message.user, number);
 });
 
 // ---------------------------------------------------------------------------
-// Slash command: /ctm — dispatches sub-commands
+// Slash command: /ctm
 // ---------------------------------------------------------------------------
 
 app.command('/ctm', async ({ command, ack, respond, client }) => {
@@ -240,11 +309,10 @@ app.command('/ctm', async ({ command, ack, respond, client }) => {
     }
 
     case 'stats': {
-      // Resolve a user mention like <@U1234|name> → U1234, or fall back to caller
       let targetUserId = command.user_id;
       if (parts[1]) {
-        const mentionMatch = parts[1].match(/^<@([A-Z0-9]+)(?:\|[^>]+)?>$/i);
-        targetUserId = mentionMatch ? mentionMatch[1] : command.user_id;
+        const m = parts[1].match(/^<@([A-Z0-9]+)(?:\|[^>]+)?>$/i);
+        targetUserId = m ? m[1] : command.user_id;
       }
       await respond({ response_type: 'ephemeral', text: formatUserStats(targetUserId) });
       break;
@@ -256,12 +324,14 @@ app.command('/ctm', async ({ command, ack, respond, client }) => {
     }
 
     case 'sync': {
+      const incremental = (parts[1] || '').toLowerCase() === 'incremental';
       await respond({
         response_type: 'ephemeral',
-        text: ":arrows_counterclockwise: Starting a full history sync in the background. This may take a while for large channels. I'll post a message here when it's done.",
+        text: incremental
+          ? ':arrows_counterclockwise: Starting an incremental sync (new messages only)…'
+          : ':arrows_counterclockwise: Starting a full history sync — this may take a few minutes for large channels…',
       });
-      // Fire-and-forget — runs in background
-      syncHistory(client, command.channel_id).catch((err) =>
+      syncHistory(client, command.channel_id, incremental).catch((err) =>
         console.error('Sync error:', err.message)
       );
       break;
@@ -306,8 +376,11 @@ app.event('app_mention', async ({ event, client }) => {
 
 (async () => {
   await app.start();
-  console.log(`⚡️ counttoamillion stats bot is running (port ${process.env.PORT || 3000})`);
-  console.log(`   Channel: ${CHANNEL_ID}`);
-  console.log(`   Stored contributors: ${Object.keys(state.userCounts).length}`);
-  console.log(`   Current count: ${state.currentCount}`);
+  const { totalCounts, totalContributors, highestCount } = getProgress(db);
+  console.log(`⚡️ counttoamillion stats bot running (port ${process.env.PORT || 3000})`);
+  console.log(`   Channel:      ${CHANNEL_ID}`);
+  console.log(`   DB:           ${process.env.DB_FILE || 'data/ctm.db'}`);
+  console.log(`   Contributors: ${totalContributors}`);
+  console.log(`   Total counts: ${totalCounts}`);
+  console.log(`   Highest #:    ${highestCount}`);
 })();

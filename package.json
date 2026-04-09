@@ -9,7 +9,8 @@
     "test": "jest"
   },
   "dependencies": {
-    "@slack/bolt": "^3.21.1"
+    "@slack/bolt": "^3.21.1",
+    "better-sqlite3": "^12.8.0"
   },
   "devDependencies": {
     "jest": "^29.7.0"
