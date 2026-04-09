@@ -511,95 +511,24 @@ app.event('app_mention', async ({ event, client }) => {
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 
-// Start the bolt receiver so it registers its internal middleware, then spin
-// up Bun.serve() to explicitly own the HTTP layer.  This ensures POST requests
-// to /slack/events are always routed to the bolt handler — app.start() alone
-// was not reliably binding the server in the Railway environment.
 (async () => {
-  await app.init();
-
-  Bun.serve({
-    port: PORT,
-    async fetch(req) {
-      const url = new URL(req.url);
-
-      if (req.method === 'POST' && url.pathname === '/slack/events') {
-        const body = await req.text();
-
-        // Handle Slack's URL-verification challenge before signature checks
-        // so the endpoint can be registered even before signing secrets are set.
-        try {
-          const parsed = JSON.parse(body);
-          if (parsed.type === 'url_verification') {
-            return new Response(JSON.stringify({ challenge: parsed.challenge }), {
-              status: 200,
-              headers: { 'Content-Type': 'application/json' },
-            });
-          }
-        } catch (_) {
-          // Not JSON — fall through to the bolt handler
-        }
-
-        // Delegate all other Slack events to the bolt receiver's request handler.
-        // We reconstruct a Node-compatible IncomingMessage/ServerResponse pair
-        // via the receiver's built-in requestHandler.
-        return new Promise((resolve) => {
-          const headers = {};
-          req.headers.forEach((value, key) => { headers[key] = value; });
-
-          // Build a minimal Node-style IncomingMessage
-          const nodeReq = Object.assign(Object.create(require('stream').Readable.prototype), {
-            method: req.method,
-            url: url.pathname + (url.search || ''),
-            headers,
-            body,
-            // Provide a readable stream interface bolt expects
-            _body: body,
-          });
-          nodeReq.push(body);
-          nodeReq.push(null);
-
-          // Build a minimal Node-style ServerResponse
-          let statusCode = 200;
-          const resHeaders = {};
-          let responseBody = '';
-          const nodeRes = {
-            statusCode,
-            setHeader(name, value) { resHeaders[name] = value; },
-            getHeader(name) { return resHeaders[name]; },
-            writeHead(code, hdrs) {
-              statusCode = code;
-              if (hdrs) Object.assign(resHeaders, hdrs);
-            },
-            end(data) {
-              responseBody = data || '';
-              resolve(new Response(responseBody, {
-                status: statusCode,
-                headers: resHeaders,
-              }));
-            },
-            write(data) { responseBody += data; },
-          };
-
-          receiver.requestHandler(nodeReq, nodeRes);
-        });
-      }
-
-      // Health-check / catch-all
-      return new Response('Not found', { status: 404 });
-    },
-  });
-
-  console.log(`⚡️ counttoamillion stats bot running on port ${PORT}`);
-
-  // Validate required env vars after the server is up.
+  // Initialise the database and resolve the counting channel ID before the
+  // server starts so that all event/command handlers are ready on the first
+  // request.  HTTPReceiver handles Slack's URL-verification challenge
+  // automatically before any user handler is invoked, so the server does not
+  // need to be up before these are resolved.
   CHANNEL_ID = process.env.CHANNEL_ID;
   if (!CHANNEL_ID) {
     console.error('⚠️  CHANNEL_ID environment variable is required. The bot is running but will not process any events until CHANNEL_ID is set and the app is restarted.');
-    return;
   }
 
   db = openDb();
+
+  // app.start() uses Bolt's built-in Node.js HTTP server via HTTPReceiver.
+  // Bun is Node-compatible so this works without any custom Bun.serve shim.
+  await app.start(PORT);
+
+  console.log(`⚡️ counttoamillion stats bot running on port ${PORT}`);
 
   const { totalCounts, totalContributors, highestCount } = getProgress(db);
   console.log(`   Channel:      ${CHANNEL_ID}`);
