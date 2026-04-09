@@ -10,6 +10,8 @@ const {
   getUserStats,
   getProgress,
   getLatestTs,
+  getLastChannelTs,
+  setLastChannelTs,
   getMeta,
   setMeta,
 } = require('../src/db');
@@ -194,4 +196,33 @@ test('setMeta overwrites existing value', () => {
   setMeta(db, 'key', 'first');
   setMeta(db, 'key', 'second');
   expect(getMeta(db, 'key')).toBe('second');
+});
+
+// ---------------------------------------------------------------------------
+// getLastChannelTs / setLastChannelTs
+// ---------------------------------------------------------------------------
+
+test('getLastChannelTs returns null when no ts has been recorded', () => {
+  expect(getLastChannelTs(db)).toBeNull();
+});
+
+test('setLastChannelTs / getLastChannelTs round-trips a ts', () => {
+  setLastChannelTs(db, '1712345678.123456');
+  expect(getLastChannelTs(db)).toBe('1712345678.123456');
+});
+
+test('setLastChannelTs overwrites the previous value', () => {
+  setLastChannelTs(db, '1000000.000001');
+  setLastChannelTs(db, '1999999.000001');
+  expect(getLastChannelTs(db)).toBe('1999999.000001');
+});
+
+test('setLastChannelTs is independent from getLatestTs (count rows)', () => {
+  // Insert a count row at ts 500
+  upsertCount(db, '500.000000', 'UAAA', 1);
+  // Record a channel ts at ts 600 (e.g. a non-count message)
+  setLastChannelTs(db, '600.000000');
+
+  expect(getLatestTs(db)).toBe('500.000000');
+  expect(getLastChannelTs(db)).toBe('600.000000');
 });

@@ -12,13 +12,13 @@ Stats are stored in a **SQLite database** on a persistent Railway Volume — fas
 
 | Command | Visibility | Description |
 |---------|-----------|-------------|
-| `/ctm leaderboard` | Public | Top 10 counters with % share |
+| `/ctm leaderboard` | Public | Top 10 counters with % share _(auto-syncs first)_ |
 | `/ctm leaderboard [N]` | Public | Top N counters (max 50) |
-| `/ctm stats` | Private | Your personal counting stats |
+| `/ctm stats` | Private | Your personal counting stats _(auto-syncs first)_ |
 | `/ctm stats @user` | Private | Stats for another user |
-| `/ctm progress` | Public | Visual progress bar toward 1,000,000 |
-| `/ctm sync` | Private | Full history rebuild from Slack _(runs in background, updates status in-place)_ |
-| `/ctm sync incremental` | Private | Only sync new messages since last sync |
+| `/ctm progress` | Public | Visual progress bar toward 1,000,000 _(auto-syncs first)_ |
+| `/ctm sync` | Private | Smart sync: incremental if DB has data, full rebuild if empty |
+| `/ctm sync full` | Private | Force a full rebuild from scratch _(use to fix corrupt data)_ |
 | `/ctm help` | Private | List all commands |
 
 You can also `@mention` the bot:
@@ -32,10 +32,11 @@ You can also `@mention` the bot:
 
 ## How it works
 
-1. **Passive listener** — silently reads every message in `#counttoamillion` and inserts valid count messages into the SQLite DB. No reactions, no replies; the bot is completely invisible.
-2. **Commands** — query the DB instantly via indexed SQL. No scanning required at command time.
-3. **First-run sync** — on initial deploy, run `/ctm sync` once to backfill the full channel history. This paginates through Slack's API, bulk-inserts all count messages, and posts a live progress update.
-4. **Incremental sync** — `/ctm sync incremental` fetches only messages newer than the most recent row in the DB, for fast catch-ups after downtime.
+1. **Passive listener** — silently reads every message in `#counttoamillion` and inserts valid count messages into the SQLite DB. It also records the latest message timestamp seen (including non-counts) so staleness checks are instant.
+2. **Auto-sync** — before responding to `leaderboard`, `stats`, or `progress` commands, the bot fetches the single latest message from the channel (1 API call) and compares its timestamp to the last one the bot has seen. If the channel is ahead, a silent incremental sync runs first (capped at ~10,000 messages). If the DB is far behind, a warning is shown prompting the user to run `/ctm sync`.
+3. **Commands** — query the DB instantly via indexed SQL. No scanning required at command time.
+4. **First-run sync** — on initial deploy, run `/ctm sync` once to backfill the full channel history. This paginates through Slack's API (999 messages per page), bulk-inserts all count messages, and posts a live progress update.
+5. **Smart `/ctm sync`** — automatically does a full rebuild if the DB is empty, otherwise only fetches new messages since the last known entry. Use `/ctm sync full` to force a complete rebuild (e.g. after a data issue).
 
 ---
 
@@ -79,7 +80,7 @@ Under **Slash Commands → Create New Command**:
 | Command | `/ctm` |
 | Request URL | `https://<your-railway-app>.railway.app/slack/events` |
 | Short Description | `counttoamillion stats` |
-| Usage Hint | `leaderboard \| stats [@user] \| progress \| sync [incremental] \| help` |
+| Usage Hint | `leaderboard \| stats [@user] \| progress \| sync [full] \| help` |
 
 ### 5. Install the app
 
@@ -146,9 +147,9 @@ In `#counttoamillion` (or any channel the bot is in), run:
 /ctm sync
 ```
 
-The bot paginates through the full channel history (200 messages per API call), bulk-inserts all valid count messages into SQLite, and updates a status message in place as it goes. For a channel with ~336k messages this takes a few minutes. When complete it posts a summary with total counts, contributors, and the highest number seen.
+The bot paginates through the full channel history (999 messages per API call — Slack's max), bulk-inserts all valid count messages into SQLite, and updates a status message in place as it goes. For a channel with ~336k messages this now takes roughly 1 minute instead of 5. When complete it posts a summary with total counts, contributors, and the highest number seen.
 
-After that, the passive listener keeps the DB up to date automatically. If the bot was offline for a while, run `/ctm sync incremental` to catch up.
+After that, the passive listener and auto-sync keep the DB current automatically. If the bot was offline for a while and the auto-sync hint appears, run `/ctm sync` to catch up. Use `/ctm sync full` to force a complete rebuild from scratch.
 
 ---
 

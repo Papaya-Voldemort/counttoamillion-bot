@@ -191,6 +191,29 @@ function getLatestTs(db) {
   return row ? row.slack_ts : null;
 }
 
+/**
+ * Returns the most recent Slack message ts seen by the passive listener,
+ * or null if the bot has never observed a message in the channel.
+ * This includes non-count messages and is used for cheap staleness detection.
+ *
+ * @param {import('better-sqlite3').Database} db
+ * @returns {string | null}
+ */
+function getLastChannelTs(db) {
+  return getMeta(db, 'last_channel_ts');
+}
+
+/**
+ * Records the most recent Slack message ts observed in the channel.
+ * Called by the passive listener on every incoming message.
+ *
+ * @param {import('better-sqlite3').Database} db
+ * @param {string} ts  Slack message timestamp string
+ */
+function setLastChannelTs(db, ts) {
+  setMeta(db, 'last_channel_ts', ts);
+}
+
 // ---------------------------------------------------------------------------
 // Meta helpers
 // ---------------------------------------------------------------------------
@@ -223,6 +246,8 @@ module.exports = {
   getUserStats,
   getProgress,
   getLatestTs,
+  getLastChannelTs,
+  setLastChannelTs,
   getMeta,
   setMeta,
 };
