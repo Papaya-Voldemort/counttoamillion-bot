@@ -216,18 +216,21 @@ let syncInProgress = false;
  *   'full'        - clears the DB then fetches all history from scratch
  *   'incremental' - fetches only messages newer than the latest row in the DB
  * @param {string|null} opts.statusChannel
- *   Slack channel to post live progress updates.  Null = silent (auto-sync).
+ *   Slack channel for ephemeral status messages.  Null = silent (auto-sync).
+ * @param {string|null} opts.statusUserId
+ *   Slack user ID to receive ephemeral status messages.  Required when statusChannel is set.
  * @param {number} [opts.pageLimit=Infinity]
  *   Stop after this many pages (used for capped auto-syncs).
  * @returns {Promise<{ messagesParsed: number, pagesFetched: number, capped: boolean }>}
  */
-async function runSync(client, { mode = 'incremental', statusChannel = null, pageLimit = Infinity } = {}) {
+async function runSync(client, { mode = 'incremental', statusChannel = null, statusUserId = null, pageLimit = Infinity } = {}) {
   if (syncInProgress) {
-    if (statusChannel) {
-      await client.chat.postMessage({
+    if (statusChannel && statusUserId) {
+      await client.chat.postEphemeral({
         channel: statusChannel,
+        user: statusUserId,
         text: ':hourglass: A sync is already running. Please wait for it to finish.',
-      });
+      }).catch((err) => console.error('Failed to post ephemeral sync status:', err.message));
     }
     return { messagesParsed: 0, pagesFetched: 0, capped: false, skipped: true };
   }
@@ -243,14 +246,6 @@ async function runSync(client, { mode = 'incremental', statusChannel = null, pag
   let messagesParsed = 0;
   let capped = false;
 
-  // Inline helper that edits the status message (no-op when statusChannel is null)
-  let statusTs = null;
-  const editStatus = async (text) => {
-    if (!statusChannel) return;
-    if (!statusTs) return;
-    await client.chat.update({ channel: statusChannel, ts: statusTs, text }).catch(() => {});
-  };
-
   try {
     if (mode === 'full') {
       clearAll(db);
@@ -259,14 +254,6 @@ async function runSync(client, { mode = 'incremental', statusChannel = null, pag
     // Capture the current sequential frontier before fetching so we know
     // where to continue from (0 for a full sync since clearAll just ran).
     const startHighest = getProgress(db).highestCount;
-
-    if (statusChannel) {
-      const posted = await client.chat.postMessage({
-        channel: statusChannel,
-        text: `:arrows_counterclockwise: *${mode === 'full' ? 'Full' : 'Incremental'} sync started…* fetching history`,
-      });
-      statusTs = posted.ts;
-    }
 
     do {
       const params = { channel: CHANNEL_ID, limit: 999, cursor };
@@ -288,11 +275,9 @@ async function runSync(client, { mode = 'incremental', statusChannel = null, pag
       cursor = result.response_metadata && result.response_metadata.next_cursor;
       pagesFetched++;
 
-      // Post live progress every 5 pages (~5,000 messages)
-      if (statusChannel && pagesFetched % 5 === 0) {
-        await editStatus(
-          `:arrows_counterclockwise: Sync in progress… *${batch.length.toLocaleString()}* candidate counts scanned (${pagesFetched} pages)`
-        );
+      // Log live progress every 5 pages (~5,000 messages)
+      if (pagesFetched % 5 === 0) {
+        console.log(`Sync in progress… ${batch.length.toLocaleString()} candidate counts scanned (${pagesFetched} pages)`);
       }
 
       // Cap auto-syncs so they don't block indefinitely
@@ -333,24 +318,27 @@ async function runSync(client, { mode = 'incremental', statusChannel = null, pag
     const { totalCounts, totalContributors, highestCount } = getProgress(db);
     console.log(`Sync done: ${messagesParsed} new counts, ${pagesFetched} pages, capped=${capped}`);
 
-    if (statusChannel) {
-      await editStatus(
-        [
+    if (statusChannel && statusUserId) {
+      await client.chat.postEphemeral({
+        channel: statusChannel,
+        user: statusUserId,
+        text: [
           `:white_check_mark: *${mode === 'full' ? 'Full' : 'Incremental'} sync complete!*`,
           `:inbox_tray: New count messages: *${messagesParsed.toLocaleString()}*`,
           `:1234: Total in DB: *${totalCounts.toLocaleString()}* from *${totalContributors.toLocaleString()}* contributors`,
           `:round_pushpin: Highest count: *${highestCount.toLocaleString()}*`,
           `:calendar: ${syncAt}`,
-        ].join('\n')
-      );
+        ].join('\n'),
+      }).catch((err) => console.error('Failed to post ephemeral sync completion:', err.message));
     }
   } catch (err) {
     console.error('Sync failed:', err.message);
-    if (statusChannel) {
-      await client.chat.postMessage({
+    if (statusChannel && statusUserId) {
+      await client.chat.postEphemeral({
         channel: statusChannel,
+        user: statusUserId,
         text: `:x: Sync failed: ${err.message}`,
-      }).catch(() => {});
+      }).catch((err) => console.error('Failed to post ephemeral sync error:', err.message));
     }
   } finally {
     syncInProgress = false;
@@ -471,12 +459,7 @@ app.command('/ctm', async ({ command, ack, respond, client }) => {
       const { capped } = await ensureFresh(client);
       const board = getLeaderboard(db, safeLimit);
       const nameMap = await resolveDisplayNames(client, board.map((r) => r.userId));
-      // Always post to the counting channel so the leaderboard is never
-      // delivered privately (e.g. when the command is run from a DM).
-      await client.chat.postMessage({ channel: CHANNEL_ID, text: formatLeaderboard(safeLimit, capped, nameMap) });
-      if (command.channel_id !== CHANNEL_ID) {
-        await respond({ response_type: 'ephemeral', text: `:white_check_mark: Leaderboard posted in <#${CHANNEL_ID}>.` });
-      }
+      await respond({ response_type: 'ephemeral', text: formatLeaderboard(safeLimit, capped, nameMap) });
       break;
     }
 
@@ -494,12 +477,7 @@ app.command('/ctm', async ({ command, ack, respond, client }) => {
 
     case 'progress': {
       await ensureFresh(client);
-      // Always post to the counting channel so progress is never delivered
-      // privately (e.g. when the command is run from a DM).
-      await client.chat.postMessage({ channel: CHANNEL_ID, text: formatProgress() });
-      if (command.channel_id !== CHANNEL_ID) {
-        await respond({ response_type: 'ephemeral', text: `:white_check_mark: Progress posted in <#${CHANNEL_ID}>.` });
-      }
+      await respond({ response_type: 'ephemeral', text: formatProgress() });
       break;
     }
 
@@ -518,7 +496,7 @@ app.command('/ctm', async ({ command, ack, respond, client }) => {
             : ':arrows_counterclockwise: Catching up on new messages…',
       });
 
-      runSync(client, { mode, statusChannel: command.channel_id }).catch((err) =>
+      runSync(client, { mode, statusChannel: command.channel_id, statusUserId: command.user_id }).catch((err) =>
         console.error('Sync error:', err.message)
       );
       break;
@@ -539,17 +517,6 @@ app.command('/ctm', async ({ command, ack, respond, client }) => {
 app.event('app_mention', async ({ event, client }) => {
   if (!db) return;
 
-  // Slack DM channel IDs start with 'D'.  Public commands should never post
-  // their content into a DM — redirect the user to the counting channel.
-  if (event.channel.startsWith('D')) {
-    await client.chat.postMessage({
-      channel: event.channel,
-      thread_ts: event.ts,
-      text: `Please use commands in <#${CHANNEL_ID}> — I won\u2019t post public content like leaderboards into DMs.`,
-    }).catch((err) => console.error('mention reply error:', err.message));
-    return;
-  }
-
   const text = (event.text || '').toLowerCase();
 
   let reply;
@@ -569,9 +536,9 @@ app.event('app_mention', async ({ event, client }) => {
     reply = formatHelp();
   }
 
-  await client.chat.postMessage({
+  await client.chat.postEphemeral({
     channel: event.channel,
-    thread_ts: event.ts,
+    user: event.user,
     text: reply,
   }).catch((err) => console.error('mention reply error:', err.message));
 });
