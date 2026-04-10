@@ -1,6 +1,6 @@
 require('dotenv').config();
 const { App } = require('@slack/bolt');
-const { parseCount } = require('./validator');
+const { parseCount, processCountBatch } = require('./validator');
 const {
   openDb,
   upsertCount,
@@ -71,7 +71,10 @@ function fmtDate(unixSec) {
 
 /**
  * Resolves Slack user IDs to display names via the API.
- * Falls back to the bare user ID if the API call fails for any user.
+ * Returns a Map of userId → resolved display name.
+ * If a user cannot be resolved, their entry is omitted from the map so that
+ * callers can fall back to the native Slack mention format `<@userId>` which
+ * Slack always renders as the correct display name.
  * @param {object}   client   Bolt Slack client
  * @param {string[]} userIds
  * @returns {Promise<Map<string, string>>}
@@ -82,10 +85,18 @@ async function resolveDisplayNames(client, userIds) {
     try {
       const res = await client.users.info({ user: userId });
       const profile = res.user && res.user.profile;
-      const name = (profile && (profile.display_name || profile.real_name)) || userId;
-      map.set(userId, name);
+      const name = profile && (
+        profile.display_name ||
+        profile.display_name_normalized ||
+        profile.real_name ||
+        profile.real_name_normalized
+      );
+      if (name) {
+        map.set(userId, name);
+      }
+      // If no usable name was returned, omit the entry so callers use <@userId>
     } catch {
-      map.set(userId, userId);
+      // API error — omit so callers fall back to <@userId>
     }
   }));
   return map;
@@ -110,8 +121,11 @@ function formatLeaderboard(limit = 10, staleWarning = false, nameMap = new Map()
   const lines = board.map(({ userId, count }, i) => {
     const prefix = MEDALS[i] || `${i + 1}.`;
     const pct = totalCounts > 0 ? ((count / totalCounts) * 100).toFixed(1) : '0.0';
-    const name = nameMap.get(userId) || userId;
-    return `${prefix} @${name} — *${count.toLocaleString()}* counts (${pct}%)`;
+    // Use resolved display name if available, otherwise use a native Slack
+    // mention (<@USERID>) which the Slack client always renders as a name.
+    const resolvedName = nameMap.get(userId);
+    const displayStr = resolvedName ? `@${resolvedName}` : `<@${userId}>`;
+    return `${prefix} ${displayStr} — *${count.toLocaleString()}* counts (${pct}%)`;
   });
 
   const parts = [
@@ -134,20 +148,21 @@ function formatLeaderboard(limit = 10, staleWarning = false, nameMap = new Map()
  * Builds a mrkdwn stats string for one user.
  * @param {string}  userId
  * @param {boolean} [staleWarning=false]
- * @param {string}  [displayName]  Plain-text name to show; falls back to userId
+ * @param {string}  [displayName]  Resolved plain-text name; falls back to <@userId>
  */
 function formatUserStats(userId, staleWarning = false, displayName = null) {
   const stats = getUserStats(db, userId);
-  const name = displayName || userId;
+  // Use resolved name or a native Slack mention that always renders correctly
+  const nameDisplay = displayName ? `@${displayName}` : `<@${userId}>`;
   if (!stats) {
-    return `@${name} hasn't contributed any counts yet.`;
+    return `${nameDisplay} hasn't contributed any counts yet.`;
   }
 
   const { userCount, rank, totalCount, totalContributors } = stats;
   const pct = totalCount > 0 ? ((userCount / totalCount) * 100).toFixed(1) : '0.0';
 
   const lines = [
-    `*:bar_chart: Stats for @${name}*`,
+    `*:bar_chart: Stats for ${nameDisplay}*`,
     `:1234: Counts posted: *${userCount.toLocaleString()}*`,
     `:trophy: Rank: *#${rank}* of ${totalContributors.toLocaleString()} contributors`,
     `:chart_with_upwards_trend: Share of all counts: *${pct}%*`,
@@ -185,14 +200,17 @@ function formatHelp() {
   return [
     '*:wave: counttoamillion Stats Bot — Commands*',
     '',
-    '*/ctm leaderboard* — Top 10 counters (public)',
+    '*/ctm leaderboard* — Top 10 counters (private)',
     '*/ctm leaderboard [N]* — Top N counters, e.g. `/ctm leaderboard 25` (max 50)',
     '*/ctm stats* — Your personal counting stats (private)',
     '*/ctm stats @user* — Stats for another user (private)',
-    '*/ctm progress* — Visual progress bar toward 1,000,000 (public)',
+    '*/ctm progress* — Visual progress bar toward 1,000,000 (private)',
     '*/ctm sync* — Catch up on missed messages (full rebuild if DB is empty)',
     '*/ctm sync full* — Force a full rebuild from scratch _(use to fix corrupt data)_',
     '*/ctm help* — This message',
+    '',
+    '*Add `-p` to any command to post the response publicly in the channel.*',
+    '_Example: `/ctm leaderboard -p` or `/ctm progress -p`_',
     '',
     '_Leaderboard and stats auto-sync from the channel before responding._',
     '',
@@ -288,20 +306,10 @@ async function runSync(client, { mode = 'incremental', statusChannel = null, sta
       }
     } while (cursor);
 
-    // Sort all candidates into chronological order (Slack returns newest-first,
-    // so we must sort before doing sequential validation).
-    batch.sort((a, b) => parseFloat(a.slackTs) - parseFloat(b.slackTs));
-
-    // Keep only counts that are exactly the next expected number in sequence.
-    // This rejects cheaters who post out-of-sequence or duplicate numbers.
-    let expected = startHighest + 1;
-    const validBatch = [];
-    for (const row of batch) {
-      if (row.number === expected) {
-        validBatch.push(row);
-        expected++;
-      }
-    }
+    // Sort all candidates into chronological order and build the valid sequential
+    // batch using the first-occurrence-per-number algorithm (more robust than a
+    // single linear pass; handles out-of-order API pages and duplicate posts).
+    const validBatch = processCountBatch(batch, startHighest);
 
     if (validBatch.length > 0) {
       bulkUpsertCounts(db, validBatch);
@@ -449,8 +457,12 @@ app.command('/ctm', async ({ command, ack, respond, client }) => {
     return;
   }
 
-  const parts = (command.text || '').trim().split(/\s+/);
+  const allParts = (command.text || '').trim().split(/\s+/).filter(Boolean);
+  // -p / --public makes the response visible to everyone in the channel
+  const publicResponse = allParts.includes('-p') || allParts.includes('--public');
+  const parts = allParts.filter((p) => p !== '-p' && p !== '--public');
   const sub = (parts[0] || '').toLowerCase();
+  const responseType = publicResponse ? 'in_channel' : 'ephemeral';
 
   switch (sub) {
     case 'leaderboard': {
@@ -459,7 +471,7 @@ app.command('/ctm', async ({ command, ack, respond, client }) => {
       const { capped } = await ensureFresh(client);
       const board = getLeaderboard(db, safeLimit);
       const nameMap = await resolveDisplayNames(client, board.map((r) => r.userId));
-      await respond({ response_type: 'ephemeral', text: formatLeaderboard(safeLimit, capped, nameMap) });
+      await respond({ response_type: responseType, text: formatLeaderboard(safeLimit, capped, nameMap) });
       break;
     }
 
@@ -471,13 +483,13 @@ app.command('/ctm', async ({ command, ack, respond, client }) => {
       }
       const { capped } = await ensureFresh(client);
       const nameMap = await resolveDisplayNames(client, [targetUserId]);
-      await respond({ response_type: 'ephemeral', text: formatUserStats(targetUserId, capped, nameMap.get(targetUserId)) });
+      await respond({ response_type: responseType, text: formatUserStats(targetUserId, capped, nameMap.get(targetUserId)) });
       break;
     }
 
     case 'progress': {
       await ensureFresh(client);
-      await respond({ response_type: 'ephemeral', text: formatProgress() });
+      await respond({ response_type: responseType, text: formatProgress() });
       break;
     }
 
