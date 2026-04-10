@@ -24,7 +24,7 @@ const { HTTPReceiver } = require('@slack/bolt');
 
 const receiver = new HTTPReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET,
-  endpoints: '/slack/events',
+  endpoints: ['/slack/events', '/slack/events/'],
 });
 
 const app = new App({
