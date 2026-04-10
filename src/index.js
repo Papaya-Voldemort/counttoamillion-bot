@@ -230,6 +230,10 @@ async function runSync(client, { mode = 'incremental', statusChannel = null, pag
       clearAll(db);
     }
 
+    // Capture the current sequential frontier before fetching so we know
+    // where to continue from (0 for a full sync since clearAll just ran).
+    const startHighest = getProgress(db).highestCount;
+
     if (statusChannel) {
       const posted = await client.chat.postMessage({
         channel: statusChannel,
@@ -252,14 +256,7 @@ async function runSync(client, { mode = 'incremental', statusChannel = null, pag
         const number = parseCount(msg.text);
         if (number !== null && msg.user) {
           batch.push({ slackTs: msg.ts, userId: msg.user, number });
-          messagesParsed++;
         }
-      }
-
-      // Flush to DB every 1000 rows to keep memory flat
-      if (batch.length >= 1000) {
-        bulkUpsertCounts(db, batch);
-        batch.length = 0;
       }
 
       cursor = result.response_metadata && result.response_metadata.next_cursor;
@@ -268,7 +265,7 @@ async function runSync(client, { mode = 'incremental', statusChannel = null, pag
       // Post live progress every 5 pages (~5,000 messages)
       if (statusChannel && pagesFetched % 5 === 0) {
         await editStatus(
-          `:arrows_counterclockwise: Sync in progress… *${messagesParsed.toLocaleString()}* counts processed (${pagesFetched} pages)`
+          `:arrows_counterclockwise: Sync in progress… *${batch.length.toLocaleString()}* candidate counts scanned (${pagesFetched} pages)`
         );
       }
 
@@ -280,10 +277,26 @@ async function runSync(client, { mode = 'incremental', statusChannel = null, pag
       }
     } while (cursor);
 
-    // Final flush
-    if (batch.length > 0) {
-      bulkUpsertCounts(db, batch);
+    // Sort all candidates into chronological order (Slack returns newest-first,
+    // so we must sort before doing sequential validation).
+    batch.sort((a, b) => parseFloat(a.slackTs) - parseFloat(b.slackTs));
+
+    // Keep only counts that are exactly the next expected number in sequence.
+    // This rejects cheaters who post out-of-sequence or duplicate numbers.
+    let expected = startHighest + 1;
+    const validBatch = [];
+    for (const row of batch) {
+      if (row.number === expected) {
+        validBatch.push(row);
+        expected++;
+      }
     }
+
+    if (validBatch.length > 0) {
+      bulkUpsertCounts(db, validBatch);
+    }
+
+    messagesParsed = validBatch.length;
 
     const syncAt = fmtDate(nowUnix());
     if (!capped) {
@@ -402,6 +415,10 @@ app.message(async ({ message }) => {
 
   const number = parseCount(message.text);
   if (number === null) return;
+
+  // Only accept the next number in the sequence.
+  const { highestCount } = getProgress(db);
+  if (number !== highestCount + 1) return;
 
   upsertCount(db, message.ts, message.user, number);
 });

@@ -1,9 +1,8 @@
 /**
  * Maximum value accepted as a valid count.  Anything larger is treated as a
- * fake/cheat number and ignored.  Set to 10× the channel goal so the bot still
- * works even if the community overshoots 1 000 000.
+ * fake/cheat number and ignored.  Matches the channel goal of 1 000 000.
  */
-const MAX_VALID_COUNT = 10_000_000;
+const MAX_VALID_COUNT = 1_000_000;
 
 /**
  * Parses a count number from a Slack message text.
