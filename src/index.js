@@ -443,7 +443,12 @@ app.command('/ctm', async ({ command, ack, respond, client }) => {
       const limit = parseInt(parts[1], 10);
       const safeLimit = Number.isNaN(limit) || limit < 1 ? 10 : Math.min(limit, 50);
       const { capped } = await ensureFresh(client);
-      await respond({ response_type: 'in_channel', text: formatLeaderboard(safeLimit, capped) });
+      // Always post to the counting channel so the leaderboard is never
+      // delivered privately (e.g. when the command is run from a DM).
+      await client.chat.postMessage({ channel: CHANNEL_ID, text: formatLeaderboard(safeLimit, capped) });
+      if (command.channel_id !== CHANNEL_ID) {
+        await respond({ response_type: 'ephemeral', text: `:white_check_mark: Leaderboard posted in <#${CHANNEL_ID}>.` });
+      }
       break;
     }
 
@@ -460,7 +465,12 @@ app.command('/ctm', async ({ command, ack, respond, client }) => {
 
     case 'progress': {
       await ensureFresh(client);
-      await respond({ response_type: 'in_channel', text: formatProgress() });
+      // Always post to the counting channel so progress is never delivered
+      // privately (e.g. when the command is run from a DM).
+      await client.chat.postMessage({ channel: CHANNEL_ID, text: formatProgress() });
+      if (command.channel_id !== CHANNEL_ID) {
+        await respond({ response_type: 'ephemeral', text: `:white_check_mark: Progress posted in <#${CHANNEL_ID}>.` });
+      }
       break;
     }
 
@@ -499,6 +509,18 @@ app.command('/ctm', async ({ command, ack, respond, client }) => {
 
 app.event('app_mention', async ({ event, client }) => {
   if (!db) return;
+
+  // Slack DM channel IDs start with 'D'.  Public commands should never post
+  // their content into a DM — redirect the user to the counting channel.
+  if (event.channel.startsWith('D')) {
+    await client.chat.postMessage({
+      channel: event.channel,
+      thread_ts: event.ts,
+      text: `Please use commands in <#${CHANNEL_ID}> — I won\u2019t post public content like leaderboards into DMs.`,
+    }).catch((err) => console.error('mention reply error:', err.message));
+    return;
+  }
+
   const text = (event.text || '').toLowerCase();
 
   let reply;
