@@ -70,11 +70,34 @@ function fmtDate(unixSec) {
 }
 
 /**
- * Builds a mrkdwn leaderboard string.
- * @param {number}  [limit=10]
- * @param {boolean} [staleWarning=false]  Show a warning that data may be partial
+ * Resolves Slack user IDs to display names via the API.
+ * Falls back to the bare user ID if the API call fails for any user.
+ * @param {object}   client   Bolt Slack client
+ * @param {string[]} userIds
+ * @returns {Promise<Map<string, string>>}
  */
-function formatLeaderboard(limit = 10, staleWarning = false) {
+async function resolveDisplayNames(client, userIds) {
+  const map = new Map();
+  await Promise.all(userIds.map(async (userId) => {
+    try {
+      const res = await client.users.info({ user: userId });
+      const profile = res.user && res.user.profile;
+      const name = (profile && (profile.display_name || profile.real_name)) || userId;
+      map.set(userId, name);
+    } catch {
+      map.set(userId, userId);
+    }
+  }));
+  return map;
+}
+
+/**
+ * Builds a mrkdwn leaderboard string.
+ * @param {number}          [limit=10]
+ * @param {boolean}         [staleWarning=false]  Show a warning that data may be partial
+ * @param {Map<string,string>} [nameMap=new Map()]  userId → display name (no pings)
+ */
+function formatLeaderboard(limit = 10, staleWarning = false, nameMap = new Map()) {
   const board = getLeaderboard(db, limit);
   if (board.length === 0) {
     return ':warning: No stats recorded yet. Run `/ctm sync` to build stats from channel history.';
@@ -87,7 +110,8 @@ function formatLeaderboard(limit = 10, staleWarning = false) {
   const lines = board.map(({ userId, count }, i) => {
     const prefix = MEDALS[i] || `${i + 1}.`;
     const pct = totalCounts > 0 ? ((count / totalCounts) * 100).toFixed(1) : '0.0';
-    return `${prefix} <@${userId}> — *${count.toLocaleString()}* counts (${pct}%)`;
+    const name = nameMap.get(userId) || userId;
+    return `${prefix} @${name} — *${count.toLocaleString()}* counts (${pct}%)`;
   });
 
   const parts = [
@@ -110,18 +134,20 @@ function formatLeaderboard(limit = 10, staleWarning = false) {
  * Builds a mrkdwn stats string for one user.
  * @param {string}  userId
  * @param {boolean} [staleWarning=false]
+ * @param {string}  [displayName]  Plain-text name to show; falls back to userId
  */
-function formatUserStats(userId, staleWarning = false) {
+function formatUserStats(userId, staleWarning = false, displayName = null) {
   const stats = getUserStats(db, userId);
+  const name = displayName || userId;
   if (!stats) {
-    return `<@${userId}> hasn't contributed any counts yet.`;
+    return `@${name} hasn't contributed any counts yet.`;
   }
 
   const { userCount, rank, totalCount, totalContributors } = stats;
   const pct = totalCount > 0 ? ((userCount / totalCount) * 100).toFixed(1) : '0.0';
 
   const lines = [
-    `*:bar_chart: Stats for <@${userId}>*`,
+    `*:bar_chart: Stats for @${name}*`,
     `:1234: Counts posted: *${userCount.toLocaleString()}*`,
     `:trophy: Rank: *#${rank}* of ${totalContributors.toLocaleString()} contributors`,
     `:chart_with_upwards_trend: Share of all counts: *${pct}%*`,
@@ -230,6 +256,10 @@ async function runSync(client, { mode = 'incremental', statusChannel = null, pag
       clearAll(db);
     }
 
+    // Capture the current sequential frontier before fetching so we know
+    // where to continue from (0 for a full sync since clearAll just ran).
+    const startHighest = getProgress(db).highestCount;
+
     if (statusChannel) {
       const posted = await client.chat.postMessage({
         channel: statusChannel,
@@ -252,14 +282,7 @@ async function runSync(client, { mode = 'incremental', statusChannel = null, pag
         const number = parseCount(msg.text);
         if (number !== null && msg.user) {
           batch.push({ slackTs: msg.ts, userId: msg.user, number });
-          messagesParsed++;
         }
-      }
-
-      // Flush to DB every 1000 rows to keep memory flat
-      if (batch.length >= 1000) {
-        bulkUpsertCounts(db, batch);
-        batch.length = 0;
       }
 
       cursor = result.response_metadata && result.response_metadata.next_cursor;
@@ -268,7 +291,7 @@ async function runSync(client, { mode = 'incremental', statusChannel = null, pag
       // Post live progress every 5 pages (~5,000 messages)
       if (statusChannel && pagesFetched % 5 === 0) {
         await editStatus(
-          `:arrows_counterclockwise: Sync in progress… *${messagesParsed.toLocaleString()}* counts processed (${pagesFetched} pages)`
+          `:arrows_counterclockwise: Sync in progress… *${batch.length.toLocaleString()}* candidate counts scanned (${pagesFetched} pages)`
         );
       }
 
@@ -280,10 +303,26 @@ async function runSync(client, { mode = 'incremental', statusChannel = null, pag
       }
     } while (cursor);
 
-    // Final flush
-    if (batch.length > 0) {
-      bulkUpsertCounts(db, batch);
+    // Sort all candidates into chronological order (Slack returns newest-first,
+    // so we must sort before doing sequential validation).
+    batch.sort((a, b) => parseFloat(a.slackTs) - parseFloat(b.slackTs));
+
+    // Keep only counts that are exactly the next expected number in sequence.
+    // This rejects cheaters who post out-of-sequence or duplicate numbers.
+    let expected = startHighest + 1;
+    const validBatch = [];
+    for (const row of batch) {
+      if (row.number === expected) {
+        validBatch.push(row);
+        expected++;
+      }
     }
+
+    if (validBatch.length > 0) {
+      bulkUpsertCounts(db, validBatch);
+    }
+
+    messagesParsed = validBatch.length;
 
     const syncAt = fmtDate(nowUnix());
     if (!capped) {
@@ -403,6 +442,10 @@ app.message(async ({ message }) => {
   const number = parseCount(message.text);
   if (number === null) return;
 
+  // Only accept the next number in the sequence.
+  const { highestCount } = getProgress(db);
+  if (number !== highestCount + 1) return;
+
   upsertCount(db, message.ts, message.user, number);
 });
 
@@ -426,7 +469,14 @@ app.command('/ctm', async ({ command, ack, respond, client }) => {
       const limit = parseInt(parts[1], 10);
       const safeLimit = Number.isNaN(limit) || limit < 1 ? 10 : Math.min(limit, 50);
       const { capped } = await ensureFresh(client);
-      await respond({ response_type: 'in_channel', text: formatLeaderboard(safeLimit, capped) });
+      const board = getLeaderboard(db, safeLimit);
+      const nameMap = await resolveDisplayNames(client, board.map((r) => r.userId));
+      // Always post to the counting channel so the leaderboard is never
+      // delivered privately (e.g. when the command is run from a DM).
+      await client.chat.postMessage({ channel: CHANNEL_ID, text: formatLeaderboard(safeLimit, capped, nameMap) });
+      if (command.channel_id !== CHANNEL_ID) {
+        await respond({ response_type: 'ephemeral', text: `:white_check_mark: Leaderboard posted in <#${CHANNEL_ID}>.` });
+      }
       break;
     }
 
@@ -437,13 +487,19 @@ app.command('/ctm', async ({ command, ack, respond, client }) => {
         targetUserId = m ? m[1] : command.user_id;
       }
       const { capped } = await ensureFresh(client);
-      await respond({ response_type: 'ephemeral', text: formatUserStats(targetUserId, capped) });
+      const nameMap = await resolveDisplayNames(client, [targetUserId]);
+      await respond({ response_type: 'ephemeral', text: formatUserStats(targetUserId, capped, nameMap.get(targetUserId)) });
       break;
     }
 
     case 'progress': {
       await ensureFresh(client);
-      await respond({ response_type: 'in_channel', text: formatProgress() });
+      // Always post to the counting channel so progress is never delivered
+      // privately (e.g. when the command is run from a DM).
+      await client.chat.postMessage({ channel: CHANNEL_ID, text: formatProgress() });
+      if (command.channel_id !== CHANNEL_ID) {
+        await respond({ response_type: 'ephemeral', text: `:white_check_mark: Progress posted in <#${CHANNEL_ID}>.` });
+      }
       break;
     }
 
@@ -482,18 +538,33 @@ app.command('/ctm', async ({ command, ack, respond, client }) => {
 
 app.event('app_mention', async ({ event, client }) => {
   if (!db) return;
+
+  // Slack DM channel IDs start with 'D'.  Public commands should never post
+  // their content into a DM — redirect the user to the counting channel.
+  if (event.channel.startsWith('D')) {
+    await client.chat.postMessage({
+      channel: event.channel,
+      thread_ts: event.ts,
+      text: `Please use commands in <#${CHANNEL_ID}> — I won\u2019t post public content like leaderboards into DMs.`,
+    }).catch((err) => console.error('mention reply error:', err.message));
+    return;
+  }
+
   const text = (event.text || '').toLowerCase();
 
   let reply;
   if (text.includes('leaderboard')) {
-    await ensureFresh(client);
-    reply = formatLeaderboard();
+    const { capped } = await ensureFresh(client);
+    const board = getLeaderboard(db, 10);
+    const nameMap = await resolveDisplayNames(client, board.map((r) => r.userId));
+    reply = formatLeaderboard(10, capped, nameMap);
   } else if (text.includes('progress')) {
     await ensureFresh(client);
     reply = formatProgress();
   } else if (text.includes('stats')) {
     const { capped } = await ensureFresh(client);
-    reply = formatUserStats(event.user, capped);
+    const nameMap = await resolveDisplayNames(client, [event.user]);
+    reply = formatUserStats(event.user, capped, nameMap.get(event.user));
   } else {
     reply = formatHelp();
   }
