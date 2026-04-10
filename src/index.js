@@ -70,11 +70,34 @@ function fmtDate(unixSec) {
 }
 
 /**
- * Builds a mrkdwn leaderboard string.
- * @param {number}  [limit=10]
- * @param {boolean} [staleWarning=false]  Show a warning that data may be partial
+ * Resolves Slack user IDs to display names via the API.
+ * Falls back to the bare user ID if the API call fails for any user.
+ * @param {object}   client   Bolt Slack client
+ * @param {string[]} userIds
+ * @returns {Promise<Map<string, string>>}
  */
-function formatLeaderboard(limit = 10, staleWarning = false) {
+async function resolveDisplayNames(client, userIds) {
+  const map = new Map();
+  await Promise.all(userIds.map(async (userId) => {
+    try {
+      const res = await client.users.info({ user: userId });
+      const profile = res.user && res.user.profile;
+      const name = (profile && (profile.display_name || profile.real_name)) || userId;
+      map.set(userId, name);
+    } catch {
+      map.set(userId, userId);
+    }
+  }));
+  return map;
+}
+
+/**
+ * Builds a mrkdwn leaderboard string.
+ * @param {number}          [limit=10]
+ * @param {boolean}         [staleWarning=false]  Show a warning that data may be partial
+ * @param {Map<string,string>} [nameMap=new Map()]  userId → display name (no pings)
+ */
+function formatLeaderboard(limit = 10, staleWarning = false, nameMap = new Map()) {
   const board = getLeaderboard(db, limit);
   if (board.length === 0) {
     return ':warning: No stats recorded yet. Run `/ctm sync` to build stats from channel history.';
@@ -87,7 +110,8 @@ function formatLeaderboard(limit = 10, staleWarning = false) {
   const lines = board.map(({ userId, count }, i) => {
     const prefix = MEDALS[i] || `${i + 1}.`;
     const pct = totalCounts > 0 ? ((count / totalCounts) * 100).toFixed(1) : '0.0';
-    return `${prefix} <@${userId}> — *${count.toLocaleString()}* counts (${pct}%)`;
+    const name = nameMap.get(userId) || userId;
+    return `${prefix} @${name} — *${count.toLocaleString()}* counts (${pct}%)`;
   });
 
   const parts = [
@@ -110,18 +134,20 @@ function formatLeaderboard(limit = 10, staleWarning = false) {
  * Builds a mrkdwn stats string for one user.
  * @param {string}  userId
  * @param {boolean} [staleWarning=false]
+ * @param {string}  [displayName]  Plain-text name to show; falls back to userId
  */
-function formatUserStats(userId, staleWarning = false) {
+function formatUserStats(userId, staleWarning = false, displayName = null) {
   const stats = getUserStats(db, userId);
+  const name = displayName || userId;
   if (!stats) {
-    return `<@${userId}> hasn't contributed any counts yet.`;
+    return `@${name} hasn't contributed any counts yet.`;
   }
 
   const { userCount, rank, totalCount, totalContributors } = stats;
   const pct = totalCount > 0 ? ((userCount / totalCount) * 100).toFixed(1) : '0.0';
 
   const lines = [
-    `*:bar_chart: Stats for <@${userId}>*`,
+    `*:bar_chart: Stats for @${name}*`,
     `:1234: Counts posted: *${userCount.toLocaleString()}*`,
     `:trophy: Rank: *#${rank}* of ${totalContributors.toLocaleString()} contributors`,
     `:chart_with_upwards_trend: Share of all counts: *${pct}%*`,
@@ -443,9 +469,11 @@ app.command('/ctm', async ({ command, ack, respond, client }) => {
       const limit = parseInt(parts[1], 10);
       const safeLimit = Number.isNaN(limit) || limit < 1 ? 10 : Math.min(limit, 50);
       const { capped } = await ensureFresh(client);
+      const board = getLeaderboard(db, safeLimit);
+      const nameMap = await resolveDisplayNames(client, board.map((r) => r.userId));
       // Always post to the counting channel so the leaderboard is never
       // delivered privately (e.g. when the command is run from a DM).
-      await client.chat.postMessage({ channel: CHANNEL_ID, text: formatLeaderboard(safeLimit, capped) });
+      await client.chat.postMessage({ channel: CHANNEL_ID, text: formatLeaderboard(safeLimit, capped, nameMap) });
       if (command.channel_id !== CHANNEL_ID) {
         await respond({ response_type: 'ephemeral', text: `:white_check_mark: Leaderboard posted in <#${CHANNEL_ID}>.` });
       }
@@ -459,7 +487,8 @@ app.command('/ctm', async ({ command, ack, respond, client }) => {
         targetUserId = m ? m[1] : command.user_id;
       }
       const { capped } = await ensureFresh(client);
-      await respond({ response_type: 'ephemeral', text: formatUserStats(targetUserId, capped) });
+      const nameMap = await resolveDisplayNames(client, [targetUserId]);
+      await respond({ response_type: 'ephemeral', text: formatUserStats(targetUserId, capped, nameMap.get(targetUserId)) });
       break;
     }
 
@@ -525,14 +554,17 @@ app.event('app_mention', async ({ event, client }) => {
 
   let reply;
   if (text.includes('leaderboard')) {
-    await ensureFresh(client);
-    reply = formatLeaderboard();
+    const { capped } = await ensureFresh(client);
+    const board = getLeaderboard(db, 10);
+    const nameMap = await resolveDisplayNames(client, board.map((r) => r.userId));
+    reply = formatLeaderboard(10, capped, nameMap);
   } else if (text.includes('progress')) {
     await ensureFresh(client);
     reply = formatProgress();
   } else if (text.includes('stats')) {
     const { capped } = await ensureFresh(client);
-    reply = formatUserStats(event.user, capped);
+    const nameMap = await resolveDisplayNames(client, [event.user]);
+    reply = formatUserStats(event.user, capped, nameMap.get(event.user));
   } else {
     reply = formatHelp();
   }
