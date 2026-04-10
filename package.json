@@ -4,8 +4,8 @@
   "description": "A stats-only Slack bot for the #counttoamillion channel that tracks counting statistics and displays leaderboards.",
   "main": "src/index.js",
   "scripts": {
-    "start": "bun src/index.js",
-    "dev": "bun --watch src/index.js",
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
     "test": "jest"
   },
   "dependencies": {
