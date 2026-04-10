@@ -111,7 +111,7 @@ function formatLeaderboard(limit = 10, staleWarning = false, nameMap = new Map()
     const prefix = MEDALS[i] || `${i + 1}.`;
     const pct = totalCounts > 0 ? ((count / totalCounts) * 100).toFixed(1) : '0.0';
     const name = nameMap.get(userId) || userId;
-    return `${prefix} @${name} — *${count.toLocaleString()}* counts (${pct}%)`;
+    return `${prefix} *${name}* — *${count.toLocaleString()}* counts (${pct}%)`;
   });
 
   const parts = [
@@ -140,14 +140,14 @@ function formatUserStats(userId, staleWarning = false, displayName = null) {
   const stats = getUserStats(db, userId);
   const name = displayName || userId;
   if (!stats) {
-    return `@${name} hasn't contributed any counts yet.`;
+    return `*${name}* hasn't contributed any counts yet.`;
   }
 
   const { userCount, rank, totalCount, totalContributors } = stats;
   const pct = totalCount > 0 ? ((userCount / totalCount) * 100).toFixed(1) : '0.0';
 
   const lines = [
-    `*:bar_chart: Stats for @${name}*`,
+    `*:bar_chart: Stats for ${name}*`,
     `:1234: Counts posted: *${userCount.toLocaleString()}*`,
     `:trophy: Rank: *#${rank}* of ${totalContributors.toLocaleString()} contributors`,
     `:chart_with_upwards_trend: Share of all counts: *${pct}%*`,
