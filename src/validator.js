@@ -26,7 +26,7 @@ function parseCount(text) {
   const match = trimmed.match(/^(\d+)(?:\s|[-]|$)/);
   if (match) {
     const n = parseInt(match[1], 10);
-    if (!Number.isFinite(n) || n > MAX_VALID_COUNT) return null;
+    if (Number.isNaN(n) || n > MAX_VALID_COUNT) return null;
     return n;
   }
   return null;
