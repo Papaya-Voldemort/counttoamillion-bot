@@ -41,10 +41,6 @@ describe('parseCount', () => {
     expect(parseCount('1000000')).toBe(1_000_000);
   });
 
-  test('accepts numbers up to the maximum valid count (1 000 000)', () => {
-    expect(parseCount('1000000')).toBe(1_000_000);
-  });
-
   test('returns null for numbers exceeding the maximum valid count', () => {
     expect(parseCount('1000001')).toBeNull();
   });
